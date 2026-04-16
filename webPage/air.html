@@ -7,11 +7,6 @@
 	<style>
 		:root { --size: 240px; --stroke: 7; }
 		body { font-family: system-ui, Segoe UI, Arial, sans-serif; margin: 0; padding: 16px; background: #0b0d10; color: #e8eef5; }
-		.knobs { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top: 12px; opacity: 0.5; }
-		.knobs { display: none; }
-		input { background:#11161d; color:#e8eef5; border:1px solid #263241; border-radius:10px; padding:10px 12px; min-width: 360px; }
-		button { background:#1a2430; color:#e8eef5; border:1px solid #263241; border-radius:10px; padding:10px 12px; cursor:pointer; }
-		button:hover { filter: brightness(1.1); }
 
 		.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 		.card { background:#0f141b; border: 0 solid #1f2a38; border-radius:14px; padding:12px; display:flex; flex-direction:column; gap:10px; }
@@ -32,475 +27,408 @@
 </head>
 <body>
 	<div id="grid" class="grid"></div>
-	<div class="knobs">
-		<input id="url" />
-		<input id="ms" type="number" min="100" step="100" style="min-width:140px" />
-		<button id="toggle">Pause</button>
-		<div style="opacity:.8;font-size:12px" id="status"></div>
-	</div>
 	<div id="err" class="err"></div>
 
 	<script>
-		/// CONFIG /////////////////////////////////////////////////////////////
-		const SPARK_POINTS = 2 * 3600 * 24 * 1 // last n datapoints ////////////
-		const DEFAULT_URL = '/io/air.json'
-		const LOG_URL = '/io/air.dat'
-		////////////////////////////////////////////////////////////////////////
+	(function () {
 
-		// Gauge limits + units (anything missing falls back to min=0, max=100, unit='')
-		const LIMITS = {
-			'1_0_ae_ug':  { min:   0, max:   7.2*20, unit: 'µg'    }, // ????? 18 / 2.5
-			'2_5_ae_ug':  { min:   0, max:  18  *20, unit: 'µg'    }, // good < 9
-			'10_0_ae_ug': { min:   0, max:  80  *20, unit: 'µg'    }, // good < 40
-			'tvoc_ppm':   { min:   0, max:    2.00, unit: 'ppm'   },
-			'hcho_mgm3':  { min:   0, max:    0.75, unit: 'mg/m³' },
-			'co2_ppm':    { min: 400, max: 2000   , unit: 'ppm'   },
-			'humidity':   { min:   0, max:     100, unit: '% rh'  },
-			'temp':       { min:   0, max:      42, unit: '°C'    },
-			'post_id':    { min:   0, max:       1, unit: ''      }
+	/// CONFIG ///////////////////////////////////////////////////////////////
+
+	const SPARK_POINTS = 2 * 3600 * 24 * 1 // last n datapoints
+	const SPARK_WIDTH  = 170               // canvas px — must match .spark css rule
+	const DEFAULT_URL  = '/io/air.json'
+	const LOG_URL      = '/io/air.dat'
+	const POLL_MS      = 500
+
+	// Gauge limits + units (anything missing falls back to min=0, max=100, unit='')
+	const LIMITS = {
+		'1_0_ae_ug':  { min:   0, max:  7.2*20, unit: 'µg'    }, // ????? 18 / 2.5
+		'2_5_ae_ug':  { min:   0, max: 18  *20, unit: 'µg'    }, // good < 9
+		'10_0_ae_ug': { min:   0, max: 80  *20, unit: 'µg'    }, // good < 40
+		'tvoc_ppm':   { min:   0, max:    2.00, unit: 'ppm'   },
+		'hcho_mgm3':  { min:   0, max:    0.75, unit: 'mg/m³' },
+		'co2_ppm':    { min: 400, max: 2000   , unit: 'ppm'   },
+		'humidity':   { min:   0, max:     100, unit: '% rh'  },
+		'temp':       { min:   0, max:      42, unit: '°C'    },
+		'post_id':    { min:   0, max:       1, unit: ''      }
+	}
+
+	const TITLES = {
+		'1_0_ae_ug':  'PM 1.0',
+		'2_5_ae_ug':  'PM 2.5',
+		'10_0_ae_ug': 'PM 10',
+		'tvoc_ppm':   'TVOC',
+		'hcho_mgm3':  'Formaldehyde',
+		'co2_ppm':    'CO₂',
+		'humidity':   'Humidity',
+		'temp'    :   'Temperature',
+		'post_id' :   'Update ID'
+	}
+
+	const DECIMALS = {
+		'tvoc_ppm':  2,
+		'hcho_mgm3': 2,
+		'default':   0
+	}
+
+	const CORRECTION_FACTORS = {
+		'humidity': 100/68,
+		'temp':     26.5/35,
+	}
+
+	const HIDE = ['post_id']
+
+	const COLORS = {
+		'temp': [
+			'oklch(0.8089 0.120861 229.51)',
+			'oklch(0.5893 0.0456 240.93)',
+			'oklch(0.4941 0.0785 139.75)',
+			'oklch(0.6684 0.1092 72.83)',
+			'oklch(0.5867 0.2146 30.71)'],
+		'humidity': [
+			'oklch(0.75 0.0617 83.86)',
+			'oklch(0.75 0.0617 83.86)',
+			'oklch(0.4941 0.0785 139.75)',
+			'oklch(0.4941 0.0715 123.88)',
+			'oklch(0.4618 0.1554 31.76)'],
+		'default': [
+			'oklch(0.3373 0.0207 254.11)',
+			'oklch(0.3635 0.0511 92.4)',
+			'oklch(0.7267 0.1233 88.94)',
+			'oklch(0.5867 0.2146 30.71)']
+	}
+
+	/// STATE ////////////////////////////////////////////////////////////////
+
+	let running = true
+	let timer   = null
+	// key -> array of normalized values in [0..1], newest at end
+	const sparkBuf = new Map()
+
+	/// UTILITIES ////////////////////////////////////////////////////////////
+
+	function clamp(v, a, b) {
+		if (v < a) return a
+		if (v > b) return b
+		return v
+	}
+
+	function fmt(key, v) {
+		const d = (key in DECIMALS) ? DECIMALS[key] : (Number.isInteger(v) ? 0 : DECIMALS.default)
+		return Number(v).toFixed(d)
+	}
+
+	function specFor(key) {
+		if (key in LIMITS) return LIMITS[key]
+		return { min: 0, max: 100, unit: "" }
+	}
+
+	function calibrate(v, key) {
+		return key in CORRECTION_FACTORS ? CORRECTION_FACTORS[key] * v : v
+	}
+
+	function normalize(v, max, min) {
+		// Returns a value clamped to [0..1] based on gauge limits
+		if (!Number.isFinite(v) || max == min) throw new Error('Can\'t normalize v')
+		return clamp((v - min) / (max - min), 0, 1)
+	}
+
+	/// COLOR ////////////////////////////////////////////////////////////////
+
+	function lerpColor(a, b, t) {
+		const lerp = (a, b, t) => a + (b - a) * t
+
+		function parseOklch(str) {
+			const [l, c, h] = str.slice(6, -1).split(" ").map(Number)
+			return { l, c, h }
+		}
+		function formatOklch(l, c, h) {
+			return `oklch(${l.toFixed(4)} ${c.toFixed(4)} ${h.toFixed(2)})`
 		}
 
-		const TITLES = {
-			'1_0_ae_ug':  'PM 1.0',
-			'2_5_ae_ug':  'PM 2.5',
-			'10_0_ae_ug': 'PM 10',
-			'tvoc_ppm':   'TVOC',
-			'hcho_mgm3':  'Formaldehyde',
-			'co2_ppm':    'CO₂',
-			'humidity':   'Humidity',
-			'temp'    :   'Temperature',
-			'post_id' :   'Update ID'
+		const c1 = parseOklch(a)
+		const c2 = parseOklch(b)
+		return formatOklch(lerp(c1.l, c2.l, t), lerp(c1.c, c2.c, t), lerp(c1.h, c2.h, t))
+	}
+
+	function getColor(pct, key) {
+		const stops  = key in COLORS ? COLORS[key] : COLORS.default
+		const n      = stops.length
+		const scaled = pct * (n - 1)
+		const i      = Math.floor(scaled)
+		const localT = scaled - i
+		if (i + 1 === n) return stops[i]
+		return lerpColor(stops[i], stops[i + 1], localT)
+	}
+
+	/// SPARKLINE ////////////////////////////////////////////////////////////
+
+	function curve(chunkNumber, chunkCount) {
+		return (chunkNumber - chunkCount) ** 2 / chunkCount ** 2
+	}
+
+	function computeCurveIntegral(chunkCount) {
+		let sum = 0
+		for (let cn = 1; cn <= chunkCount; cn++) sum += curve(cn, chunkCount)
+		return sum
+	}
+
+	const CURVE_INTEGRAL = computeCurveIntegral(SPARK_WIDTH)
+
+	function getNormalizedChunk(chunkNumber, chunkCount, dataLength) {
+		// 1-based, so chunkCount is inclusive.
+		// The curve tapers down to 0, so reserve 1 data point for every chunk.
+		const curvedDataCount = dataLength - chunkCount
+		return curve(chunkNumber, chunkCount) / CURVE_INTEGRAL * curvedDataCount + 1
+	}
+
+	function averageExtrapolated(data, indexFloat, valuesCountFloat) {
+		if (!data.length) return 0
+		if (valuesCountFloat < 0.999) throw new Error("valuesCountFloat < 1")
+
+		const windowStart = indexFloat
+		const windowEnd   = indexFloat + valuesCountFloat
+
+		if (windowStart <= -1)          throw new Error("windowStart <= -1")
+		if (windowEnd > data.length)    throw new Error("range exceeds data by 1 point or more")
+
+		const iStart = Math.floor(windowStart)
+		const iEnd   = Math.floor(windowEnd)
+
+		let sum = 0
+		for (let i = iStart; i <= iEnd; i++) {
+			const weight  = Math.min(i + 1, windowEnd) - Math.max(i, windowStart)
+			const clamped = Math.max(0, Math.min(data.length - 1, i))
+			sum += data[clamped] * weight
 		}
+		return sum / valuesCountFloat
+	}
 
-		const DECIMALS = {
-			'tvoc_ppm': 2,
-			'hcho_mgm3': 2,
-			'default': 0
-		}
+	function resampleNonLinear(data, numberOfSamples) {
+		if (!data.length || numberOfSamples <= 0) return []
+		if (data.length === 1) return Array(numberOfSamples).fill(data[0])
 
-		const CORRECTION_FACTORS = {
-			'humidity': 100/68,
-			'temp': 26.5/35,
-		}
+		const out = []
+		let dataIndex = 0
 
-		const HIDE = ['post_id']
-
-		const COLORS = {
-			'temp':    [
-				'oklch(0.8089 0.120861 229.51)',
-				'oklch(0.5893 0.0456 240.93)',
-				'oklch(0.4941 0.0785 139.75)',
-				'oklch(0.6684 0.1092 72.83)',
-				'oklch(0.5867 0.2146 30.71)'],
-			'humidity': [
-				'oklch(0.75 0.0617 83.86)',
-				'oklch(0.75 0.0617 83.86)',
-				'oklch(0.4941 0.0785 139.75)',
-				'oklch(0.4941 0.0715 123.88)',
-				'oklch(0.4618 0.1554 31.76)'],
-			'default': [
-				'oklch(0.3373 0.0207 254.11)',
-				'oklch(0.3635 0.0511 92.4)',
-				'oklch(0.7267 0.1233 88.94)',
-				'oklch(0.5867 0.2146 30.71)']
-		}
-
-		/// APP ////////////////////////////////////////////////////////////////
-		const elUrl = document.getElementById("url")
-		const elMs = document.getElementById("ms")
-		const elGrid = document.getElementById("grid")
-		const elErr = document.getElementById("err")
-		const elStatus = document.getElementById("status")
-		const elToggle = document.getElementById("toggle")
-
-		elUrl.value = DEFAULT_URL
-		elMs.value = 500
-
-		let running = true
-		let timer = null
-		// key -> array of normalized values in [0..1], newest at end
-		const sparkBuf = new Map()
-
-
-		function clamp(v, a, b) {
-			if (v < a) return a
-			if (v > b) return b
-			return v
-		}
-
-
-		function fmt(key, v) {
-			const d = (key in DECIMALS) ? DECIMALS[key] : (Number.isInteger(v) ? 0 : DECIMALS.default)
-			return Number(v).toFixed(d)
-		}
-
-
-		function specFor(key) {
-			if (key in LIMITS) return LIMITS[key]
-			return { min: 0, max: 100, unit: "" }
-		}
-
-
-		function calibrate(v, key) {
-			return key in CORRECTION_FACTORS ? CORRECTION_FACTORS[key] * v : v
-		}
-
-
-		function ringSVG(pct, key) {
-			const size = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--size")) || 240
-			const stroke = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--stroke")) || 7
-			const r = (size / 2) - (stroke / 2)
-			const c = 2 * Math.PI * r
-			const dash = pct * c
-			return `
-				<svg viewBox="0 0 ${size} ${size}" aria-hidden="true">
-					<circle class="track" cx="${size/2}" cy="${size/2}" r="${r}"></circle>
-					<circle class="progress" cx="${size/2}" cy="${size/2}" r="${r}"
-						stroke-dasharray="${dash} ${c - dash}" style="stroke: ${getColor(pct, key)};"></circle>
-				</svg>
-			`
-		}
-
-
-		function pushSpark(key, norm01) {
-			let buf = sparkBuf.get(key)
-			if (!buf) {
-				buf = []
-				sparkBuf.set(key, buf)
+		for (let sNum = 1; sNum <= numberOfSamples; sNum++) {
+			let chunk = getNormalizedChunk(sNum, numberOfSamples, data.length)
+			if (sNum === numberOfSamples) {
+				// last sample is exactly the remainder of data
+				chunk = data.length - dataIndex
 			}
-			buf.push(norm01)
-			if (buf.length > SPARK_POINTS)
-				buf.splice(0, buf.length - SPARK_POINTS)
+			out.push(averageExtrapolated(data, dataIndex, chunk))
+			dataIndex += chunk
 		}
+		return out
+	}
 
-
-		function drawPixel(context, x, y) {
-			var roundedX = Math.floor(x)
-			var roundedY = Math.floor(y)
-			context.fillStyle = "rgba(232,238,245,0.3)"
-			context.fillRect(roundedX, roundedY, 1, 1)
+	function pushSpark(key, norm01) {
+		let buf = sparkBuf.get(key)
+		if (!buf) {
+			buf = []
+			sparkBuf.set(key, buf)
 		}
+		buf.push(norm01)
+		if (buf.length > SPARK_POINTS) buf.splice(0, buf.length - SPARK_POINTS)
+	}
 
+	function drawPixel(ctx, x, y) {
+		ctx.fillStyle = "rgba(232,238,245,0.3)"
+		ctx.fillRect(Math.floor(x), Math.floor(y), 1, 1)
+	}
 
-		function lerpColor(a, b, t) {
-			const lerp = (a, b, t) => a + (b - a) * t
+	function drawSpark(canvas, key) {
+		const buf = sparkBuf.get(key) || []
+		const ctx = canvas.getContext("2d", { alpha: true })
+		const w   = canvas.width
+		const h   = canvas.height
 
-			function parseOklch(str) {
-				const [l, c, h] = str.slice(6, -1).split(" ").map(Number);
-				return { l, c, h };
-			}
-			function formatOklch(l, c, h) {
- 				return `oklch(${l.toFixed(4)} ${c.toFixed(4)} ${h.toFixed(2)})`;
-			}
-			c1 = parseOklch(a)
-			c2 = parseOklch(b)
-			const l = lerp(c1.l, c2.l, t)
-			const c = lerp(c1.c, c2.c, t)
-			const h = lerp(c1.h, c2.h, t)
-			const lch = formatOklch(l, c, h)
-			return lch
+		const bufToY = b => (1 - clamp(b, 0, 1)) * (h - 1)
+
+		ctx.clearRect(0, 0, w, h)
+		if (buf.length < w) return
+
+		const sampled = resampleNonLinear(buf, w)
+		const pct     = clamp(buf[buf.length - 1], 0, 1)
+
+		ctx.beginPath()
+		ctx.strokeStyle = getColor(pct, key)
+		ctx.lineWidth   = 1
+		ctx.moveTo(0, bufToY(sampled[0]))
+		for (let x = 1; x < sampled.length; x++) ctx.lineTo(x, bufToY(sampled[x]))
+		ctx.stroke()
+
+		// x-axis tick dots
+		for (let t = 0; t <= 10; t++) drawPixel(ctx, Math.round((t / 10) * (w - 1)), h - 1)
+
+		// y-axis dots
+		for (let y = 0; y <= 10; y++) drawPixel(ctx, w - 1, Math.round((y / 10) * (h - 1)))
+
+		// average line across raw buffer
+		const allAvg = buf.reduce((sum, v) => sum + v, 0) / buf.length
+		ctx.beginPath()
+		ctx.moveTo(0, bufToY(allAvg))
+		ctx.lineTo(w, bufToY(allAvg))
+		ctx.strokeStyle = getColor(clamp(allAvg, 0, 1), key)
+		ctx.lineWidth   = 1
+		ctx.stroke()
+	}
+
+	/// GAUGE ////////////////////////////////////////////////////////////////
+
+	function ringSVG(pct, key) {
+		const size   = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--size")) || 240
+		const stroke = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--stroke")) || 7
+		const r      = (size / 2) - (stroke / 2)
+		const c      = 2 * Math.PI * r
+		const dash   = pct * c
+		return `
+			<svg viewBox="0 0 ${size} ${size}" aria-hidden="true">
+				<circle class="track" cx="${size/2}" cy="${size/2}" r="${r}"></circle>
+				<circle class="progress" cx="${size/2}" cy="${size/2}" r="${r}"
+					stroke-dasharray="${dash} ${c - dash}" style="stroke: ${getColor(pct, key)};"></circle>
+			</svg>
+		`
+	}
+
+	/// DOM //////////////////////////////////////////////////////////////////
+
+	function upsertCard(key) {
+		let card = document.querySelector(`[data-k="${CSS.escape(key)}"]`)
+		if (card) return card
+
+		card = document.createElement("div")
+		card.className = "card"
+		card.dataset.k = key
+
+		const title = document.createElement("div")
+		title.className = "title"
+		title.textContent = TITLES[key]
+
+		const gwrap = document.createElement("div")
+		gwrap.className = "gwrap"
+
+		const ring = document.createElement("div")
+		ring.className = "ring"
+		ring.innerHTML = ringSVG(0, key)
+
+		const spark = document.createElement("canvas")
+		spark.className = "spark"
+		spark.width  = SPARK_WIDTH // matches .spark css rule
+		spark.height = 140 // matches css rule
+		ring.appendChild(spark)
+
+		const center = document.createElement("div")
+		center.className = "center"
+		center.innerHTML = `<div class="value">--</div><div class="unit"></div>`
+		ring.appendChild(center)
+
+		gwrap.appendChild(ring)
+
+		const meta = document.createElement("div")
+		meta.className = "meta"
+		meta.innerHTML = `<div class="max"></div>`
+
+		card.appendChild(title)
+		card.appendChild(gwrap)
+		card.appendChild(meta)
+
+		elGrid.appendChild(card)
+		return card
+	}
+
+	function render(data) {
+		elErr.textContent = ""
+
+		// Stable order: known keys first in LIMITS order, then extras alphabetical
+		const keys    = Object.keys(data)
+		const ordered = [
+			...Object.keys(LIMITS).filter(k => keys.includes(k)),
+			...keys.filter(k => !(k in LIMITS)).sort()
+		]
+
+		for (const key of ordered) {
+			if (HIDE.indexOf(key) > -1) continue
+
+			let v = calibrate(Number(data[key]), key)
+			const { min, max, unit } = specFor(key)
+			const pctClamped = clamp((max === min) ? 0 : (v - min) / (max - min), 0, 1)
+
+			const card = upsertCard(key)
+			card.querySelector(".ring").firstElementChild.outerHTML = ringSVG(pctClamped, key)
+			card.querySelector(".value").textContent = Number.isFinite(v) ? fmt(key, v) : "--"
+			card.querySelector(".unit").textContent  = unit || ""
+			card.querySelector(".max").textContent   = `max: ${max}`
+
+			pushSpark(key, normalize(v, max, min))
+			drawSpark(card.querySelector(".spark"), key)
 		}
+	}
 
+	/// POLLING //////////////////////////////////////////////////////////////
 
-		function getColor(pct, key) {
-			const stops = key in COLORS ? COLORS[key] : COLORS.default
-			const n = stops.length
-			const scaled = pct * (n - 1)
-			const i = Math.floor(scaled)
-			const localT = scaled - i
-			if (i + 1 === n) return stops[i]
-			return lerpColor(stops[i], stops[i + 1], localT)
+	async function pollOnce() {
+		const t0 = performance.now()
+		try {
+			const res  = await fetch(DEFAULT_URL, { cache: "no-store" })
+			if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
+			render(await res.json())
+		} catch (e) {
+			elErr.textContent = String(e && e.stack ? e.stack : e)
+		} finally {
+			if (running) timer = setTimeout(pollOnce, POLL_MS)
 		}
+	}
 
-
-		function normalize(v, max, min) {
-			// Sparkline uses normalized value (clamped to [0..1]) based on gauge limits
-			if (!Number.isFinite(v) || max == min) throw new Error('Can\'t normalize v')
-			return clamp((v - min) / (max - min), 0, 1)
-		}
-
-
-		let curveIntegral = 0;
-		function curve(chunkNumber, chunkCount) {
-			return (chunkNumber - chunkCount) ** 2 / chunkCount ** 2
-		}
-
-
-		function getNormalizedChunk(chunkNumber, chunkCount, dataLength) {
-			// 1-based, so chunkCount is inclusive.
-			// the curve tapers down to 0,
-			// so reserve 1 data point for every chunk
-			let curvedDataCount = dataLength - chunkCount
-			if (curveIntegral == 0) {
-				for (let cn = 1; cn <= chunkCount; cn++) {
-					curveIntegral += curve(cn, chunkCount)
-				}
-			}
-			// a chunk is at least 1 data point
-			return curve(chunkNumber, chunkCount) / curveIntegral * curvedDataCount + 1
-		}
-
-
-		function averageExtrapolated(data, indexFloat, valuesCountFloat) {
-			if (!data.length) return 0
-			if (valuesCountFloat < 0.999) throw new Error("valuesCountFloat < 1")
-
-			const windowStart = indexFloat
-			const windowEnd   = indexFloat + valuesCountFloat
-
-			if (windowStart <= -1) throw new Error("windowStart <= -1")
-			if (windowEnd > data.length) throw new Error("range exceeds data by 1 point or more")
-
-			const iStart = Math.floor(windowStart)
-			const iEnd   = Math.floor(windowEnd)
-
-			let sum = 0
-
-			for (let i = iStart; i <= iEnd; i++) {
-				const weight  = Math.min(i + 1, windowEnd) - Math.max(i, windowStart)
-				const clamped = Math.max(0, Math.min(data.length - 1, i))
-				sum += data[clamped] * weight
-			}
-
-			return sum / valuesCountFloat
-		}
-
-
-		function resampleNonLinear(data, numberOfSamples) {
-			if (!data.length || numberOfSamples <= 0) return []
-			if (data.length === 1) return Array(numberOfSamples).fill(data[0])
-
-			const out = []
-			let dataIndex = 0
-			for (let sNum = 1; sNum <= numberOfSamples; sNum++) {
-				let chunk = getNormalizedChunk(sNum, numberOfSamples, data.length)
-				if (sNum == numberOfSamples) {
-					// last sample is exactly remainder of data
-					chunk = data.length - dataIndex
-				}
-				const sample = averageExtrapolated(data, dataIndex, chunk)
-				out.push(sample)
-				dataIndex += chunk
-			}
-
-			return out
-		}
-
-
-		function drawSpark(canvas, key) {
-			const buf = sparkBuf.get(key) || []
-			const ctx = canvas.getContext("2d", { alpha: true })
-
-			const w = canvas.width
-			const h = canvas.height
-
-			const bufToY = b => (1 - clamp(b, 0, 1)) * (h - 1)
-
-			ctx.clearRect(0, 0, w, h)
-			if (buf.length < w) return
-
-			const sampled = resampleNonLinear(buf, w)
-
-			ctx.beginPath()
-			const pct = clamp(buf[buf.length - 1], 0, 1)
-			ctx.strokeStyle = getColor(pct, key)
-			ctx.lineWidth = 1
-
-			ctx.moveTo(0, bufToY(sampled[0]))
-			for (let x = 1; x < sampled.length; x++) {
-				ctx.lineTo(x, bufToY(sampled[x]))
-			}
-			ctx.stroke()
-
-			// x-axis tick dots using the same non-linear mapping
-			const tickCount = 10
-			for (let t = 0; t <= tickCount; t++) {
-				const x = Math.round((t / tickCount) * (w - 1))
-				drawPixel(ctx, x, h - 1)
-			}
-
-			// y-axis dots
-			for (let y = 0; y <= 10; y++) {
-				drawPixel(ctx, w - 1, Math.round((y / 10) * (h - 1)))
-			}
-
-			// average line across raw buffer
-			const allAvg = buf.reduce((sum, v) => sum + v, 0) / buf.length
-			const avgY = bufToY(allAvg)
-			ctx.beginPath()
-			ctx.moveTo(0, avgY)
-			ctx.lineTo(w, avgY)
-			ctx.strokeStyle = getColor(clamp(allAvg, 0, 1), key)
-			ctx.lineWidth = 1
-			ctx.stroke()
-		}
-
-
-		function upsertCard(key) {
-			let card = document.querySelector(`[data-k="${CSS.escape(key)}"]`)
-			if (card) return card
-
-			card = document.createElement("div")
-			card.className = "card"
-			card.dataset.k = key
-
-			const k = document.createElement("div")
-			k.className = "title"
-			k.textContent = TITLES[key]
-
-			const gwrap = document.createElement("div")
-			gwrap.className = "gwrap"
-
-			const ring = document.createElement("div")
-			ring.className = "ring"
-			ring.innerHTML = ringSVG(0, key)
-
-			const spark = document.createElement("canvas")
-			spark.className = "spark"
-			spark.width = 170 // same as css rule
-			spark.height = 140 // same as css rule
-			ring.appendChild(spark)
-
-			const center = document.createElement("div")
-			center.className = "center"
-			center.innerHTML = `<div class="value">--</div><div class="unit"></div>`
-			ring.appendChild(center)
-
-			gwrap.appendChild(ring)
-
-			const meta = document.createElement("div")
-			meta.className = "meta"
-			meta.innerHTML = `<div class="max"></div>`
-
-			card.appendChild(k)
-			card.appendChild(gwrap)
-			card.appendChild(meta)
-
-			elGrid.appendChild(card)
-			return card
-		}
-
-
-		function render(data) {
-			elErr.textContent = ""
-			const keys = Object.keys(data)
-
-			// Stable order: known keys first in LIMITS order, then extras alphabetical
-			const ordered = [
-				...Object.keys(LIMITS).filter(k => keys.includes(k)),
-				...keys.filter(k => !(k in LIMITS)).sort()
-			]
-
-			for (const key of ordered) {
-				if (HIDE.indexOf(key) > -1)
-					continue
-				let v = Number(data[key])
-				v = calibrate(v, key)
-				const { min, max, unit } = specFor(key)
-
-				const card = upsertCard(key)
-				const pct = (max === min) ? 0 : ((v - min) / (max - min))
-				const pctClamped = clamp(pct, 0, 1)
-
-				const ring = card.querySelector(".ring")
-				ring.firstElementChild.outerHTML = ringSVG(pctClamped, key)
-
-				card.querySelector(".value").textContent = Number.isFinite(v) ? fmt(key, v) : "--"
-				card.querySelector(".unit").textContent = unit || ""
-
-				// card.querySelector(".min").textContent = `min: ${min}`
-				card.querySelector(".max").textContent = `max: ${max}`
-
-				pushSpark(key, normalize(v, max, min))
-				drawSpark(card.querySelector(".spark"), key)
-			}
-		}
-
-
-		// pre-load data for sparkline, then start polling
-		function go() {
-			fetch(LOG_URL, {
-				method: 'GET',
-				headers: {
-					'Range': 'bytes=-' + (150 * SPARK_POINTS)
-				}
-			})
-			.then(res => {
-				if (!res.ok && res.status !== 206)
-					throw new Error('HTTP ' + res.status)
-				return res.text()
-			})
-			.then(air_dat => {
-				const log = []
-				air_dat.split('\n').splice(-SPARK_POINTS).forEach(line => {
-					try { log.push(JSON.parse(line)) } catch (e) {}
-				})
-
-				running = false
-
-				/// all this to sort object keys by known keys from LIMITS ???
-				log.forEach(data => {
-					const keys = Object.keys(data)
-					const ordered = [
-						...Object.keys(LIMITS).filter(k => keys.includes(k)),
-						...keys.filter(k => !(k in LIMITS)).sort()
-					]
-					for (const key of ordered) {
-						let v = Number(data[key])
-						v = calibrate(v, key)
-						const { min, max, unit } = specFor(key)
-						const pct = (max === min) ? 0 : (v - min) / (max - min) * 100
-						const pctClamped = clamp(pct, 0, 100)
-						pushSpark(key, normalize(v, max, min))
-					}
-				})
-
-				running = true
-				pollOnce()
-			})
-			.catch(() => {})
-
-			// will be paused/resumed after log has downloaded
-			pollOnce()
-		}
-
-
-		async function pollOnce() {
-			const url = elUrl.value.trim()
-			const ms = Math.max(100, Number(elMs.value) || 1000)
-
-			const t0 = performance.now()
-			try {
-				const res = await fetch(url, { cache: "no-store" })
-				if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
-				const data = await res.json()
-				render(data)
-				const dt = Math.round(performance.now() - t0)
-				elStatus.textContent = `ok • ${dt} ms • ${new Date().toLocaleTimeString()}`
-			} catch (e) {
-				elStatus.textContent = `error • ${new Date().toLocaleTimeString()}`
-				elErr.textContent = String(e && e.stack ? e.stack : e)
-			} finally {
-				if (running) timer = setTimeout(pollOnce, ms)
-			}
-		}
-
-
-		elToggle.addEventListener("click", () => {
-			running = !running
-			elToggle.textContent = running ? "Pause" : "Resume"
-			if (running) pollOnce()
-			else if (timer) clearTimeout(timer)
+	// Pre-loads historical data for sparklines, then starts the polling loop.
+	function loadHistoryAndStart() {
+		fetch(LOG_URL, {
+			method: 'GET',
+			headers: { 'Range': 'bytes=-' + (150 * SPARK_POINTS) }
 		})
+		.then(res => {
+			if (!res.ok && res.status !== 206) throw new Error('HTTP ' + res.status)
+			return res.text()
+		})
+		.then(air_dat => {
+			const log = []
+			air_dat.split('\n').splice(-SPARK_POINTS).forEach(line => {
+				try { log.push(JSON.parse(line)) } catch (e) {}
+			})
 
+			running = false
 
-		elUrl.addEventListener("change", () => { if (running) { if (timer) clearTimeout(timer); pollOnce(); } })
+			log.forEach(data => {
+				const keys    = Object.keys(data)
+				const ordered = [
+					...Object.keys(LIMITS).filter(k => keys.includes(k)),
+					...keys.filter(k => !(k in LIMITS)).sort()
+				]
+				for (const key of ordered) {
+					const v         = calibrate(Number(data[key]), key)
+					const { min, max } = specFor(key)
+					pushSpark(key, normalize(v, max, min))
+				}
+			})
 
+			running = true
+			pollOnce()
+		})
+		.catch(() => {})
 
-		elMs.addEventListener("change", () => { if (running) { if (timer) clearTimeout(timer); pollOnce(); } })
+		// Begin polling immediately; will be briefly paused while history loads above
+		pollOnce()
+	}
 
+	/// INIT /////////////////////////////////////////////////////////////////
 
-		go()
+	const elGrid = document.getElementById("grid")
+	const elErr  = document.getElementById("err")
+
+	loadHistoryAndStart()
+
+	})()
 	</script>
 </body>
 </html>
